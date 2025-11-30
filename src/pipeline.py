@@ -146,7 +146,7 @@ class HybridToolPipeline:
             if filter_result:
                 filter_data = parse_pydantic_safe(filter_result, FilterResult)
                 if filter_data and filter_data.is_ai:
-                    logger.info(f"✓ AI-related: {title_short}")
+                    logger.info(f"✓ AI-related: {title}")
                     if tag_result:
                         tag_data = parse_pydantic_safe(tag_result, TagResult)
                         article.tags = tag_data.tags if tag_data else []
@@ -155,7 +155,7 @@ class HybridToolPipeline:
                     return article
                 else:
                     reason = filter_data.reasoning if filter_data else "Unknown"
-                    logger.debug(f"✗ Not AI-related: {title_short} - {reason}")
+                    logger.info(f"✗ Not AI-related: {title} - {reason}")
 
             return None
 

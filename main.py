@@ -19,8 +19,8 @@ if __name__ == "__main__":
     
     # Default feeds
     feeds = [
-        # "https://techcrunch.com/feed/",
         "https://www.databricks.com/feed",
+        # "https://techcrunch.com/feed/",
         # "https://developers.googleblog.com/feeds/posts/default"
     ]
     
