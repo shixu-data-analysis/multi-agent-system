@@ -15,7 +15,12 @@ def create_tagging_agent(model_name: str = "gemini-2.5-flash-lite", retry_config
         name="tagging_agent",
         model=Gemini(model=model_name, retry_options=retry_config),
         instruction=f"""
-        You are an AI news tagger. Add relevant tags to this AI article.
+        You are an AI news tagger.
+        
+        First, check the output from the previous step.
+        If "is_ai" is false, return empty tags: {{"tags": []}}
+        
+        Otherwise, add relevant tags to this AI article.
         
         Available tags:
         - {tags_list}
