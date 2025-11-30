@@ -1,88 +1,88 @@
 import feedparser
 import concurrent.futures
-from typing import List, Dict, Any
+from typing import List
+from src.utils.date_utils import normalize_rss_timestamp
+from src.models.article import Article, FeedResult
+from src.utils.logger import get_logger
 
-def fetch_rss(feed_url: str) -> List[Dict[str, Any]]:
+logger = get_logger(__name__)
+
+def fetch_rss(feed_url: str) -> FeedResult:
     """
-    Fetches and parses an RSS feed.
+    Fetch and parse a single RSS/Atom feed.
 
-    Args:
-        feed_url: The URL of the RSS feed.
-
-    Returns:
-        A list of dictionaries, where each dictionary represents an article
-        and contains keys like 'title', 'link', 'summary', 'published', 'source'.
+    Returns a FeedResult containing:
+        - feed_url
+        - last_build_date (RSS <lastBuildDate> or Atom <updated>)
+        - articles: list of Article objects
     """
     try:
         feed = feedparser.parse(feed_url)
+
+        raw_last_build_date = feed.feed.get("updated_parsed")
+
         articles = []
         for entry in feed.entries:
-            article = {
-                "title": entry.get("title", ""),
-                "link": entry.get("link", ""),
-                "summary": entry.get("summary", "") or entry.get("description", ""),
-                "published": entry.get("published", "") or entry.get("updated", ""),
-                "source": feed.feed.get("title", "")
-            }
+            raw_published = entry.get("published_parsed") or entry.get("updated_parsed")
+            article = Article(
+                feed_url=feed_url,
+                title=entry.get("title", ""),
+                link=entry.get("link", ""),
+                summary=entry.get("summary", "") or entry.get("description", ""),
+                published=normalize_rss_timestamp(raw_published),
+                source=feed.feed.get("title", "")
+            )
             articles.append(article)
-        return articles
+
+        return FeedResult(
+            feed_url=feed_url,
+            last_build_date=normalize_rss_timestamp(raw_last_build_date),
+            articles=articles
+        )
+
     except Exception as e:
-        print(f"Error fetching {feed_url}: {e}")
-        return []
+        logger.error(f"Error fetching {feed_url}: {e}")
+        return FeedResult(
+            feed_url=feed_url,
+            last_build_date=None,
+            articles=[]
+        )
 
-def fetch_all_rss(feed_urls: List[str]) -> List[Dict[str, Any]]:
+
+def fetch_all_rss(feed_urls: List[str]) -> List[FeedResult]:
     """
-    Fetches articles from multiple RSS feeds in parallel.
+    Fetch multiple RSS feeds in parallel.
 
-    Args:
-        feed_urls: List of RSS feed URLs.
-
-    Returns:
-        A flat list of all fetched articles.
+    Returns a list of FeedResult objects.
     """
-    all_articles = []
+    results = []
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_url = {executor.submit(fetch_rss, url): url for url in feed_urls}
-        for future in concurrent.futures.as_completed(future_to_url):
-            url = future_to_url[future]
+        futures = {executor.submit(fetch_rss, url): url for url in feed_urls}
+
+        for future in concurrent.futures.as_completed(futures):
+            feed_url = futures[future]
             try:
-                articles = future.result()
-                all_articles.extend(articles)
-                print(f"Fetched {len(articles)} items from {url}")
+                result = future.result()
+                logger.info(f"Fetched {len(result.articles)} items from {feed_url}")
+                results.append(result)
             except Exception as e:
-                print(f"Error fetching {url}: {e}")
-    
-    return all_articles
+                logger.error(f"Error fetching {feed_url}: {e}")
+                results.append(FeedResult(
+                    feed_url=feed_url,
+                    last_build_date=None,
+                    articles=[]
+                ))
 
-def fetch_rss_articles(feed_urls: List[str]) -> Dict[str, Any]:
-    """
-    Fetch articles from RSS feeds.
-    
-    Args:
-        feed_urls: List of RSS feed URLs to fetch from.
-    
-    Returns:
-        Dictionary with 'articles' list and 'count' of fetched articles.
-    """
-    articles = fetch_all_rss(feed_urls)
-    
-    return {
-        "articles": articles,
-        "count": len(articles),
-        "status": "success"
-    }
+    return results
 
-# Create FunctionTool instance
-from google.adk.tools import FunctionTool
-fetch_tool = FunctionTool(fetch_rss_articles)
 
+# Manual test: optional
 if __name__ == "__main__":
-    # Test with a sample feed
     urls = [
         "https://techcrunch.com/feed/",
-        "https://developers.googleblog.com/feeds/posts/default"
+        "https://developers.googleblog.com/feeds/posts/default",
     ]
-    items = fetch_all_rss(urls)
-    print(f"Total fetched: {len(items)}")
-    if items:
-        print(items[0])
+    results = fetch_all_rss(urls)
+    for result in results:
+        print(f"{result.feed_url}: {len(result.articles)} articles")

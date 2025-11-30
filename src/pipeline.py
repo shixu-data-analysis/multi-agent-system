@@ -1,46 +1,51 @@
-import os
-import json
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.adk.plugins.logging_plugin import LoggingPlugin
 from google.genai import types
 
 from src.agents.processing_pipeline import create_processing_pipeline
-from src.agents.orchestrator import create_orchestrator
+from src.tools.dedup import deduplicate_articles_tool
+from src.tools.storage import store_articles
+from src.tools.fetch_rss import fetch_all_rss
+from src.utils.json_utils import parse_pydantic_safe
+from src.models.article import Article, FilterResult, TagResult
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
+
 
 @dataclass
 class PipelineConfig:
     """Configuration for the Hybrid Tool Pipeline."""
     model_name: str = "gemini-2.5-flash-lite"
-    max_articles: int = 6
-    concurrency_limit: int = 3  # Limit concurrent LLM calls
+    max_articles: int = -1
+    concurrency_limit: int = 3
     retry_attempts: int = 5
     retry_delay_multiplier: int = 7
     retry_initial_delay: int = 1
     user_id: str = "pipeline_user"
     app_name: str = "hybrid_tool_pipeline"
 
+
 class HybridToolPipeline:
     """
-    Hybrid AI News Pipeline using FunctionTools + SequentialAgent.
-    
-    Architecture:
-    - FunctionTools for utilities (fetch, dedup, storage)
-    - SequentialAgent for LLM agents (filter, tag) - processes each article
-    - LlmAgent orchestrator coordinates everything
+    Hybrid AI News Pipeline using:
+        - FunctionTools for fetch + dedup + storage
+        - SequentialAgent for LLM-based filtering and tagging
+        - Orchestrator agent coordinating all tool calls
     """
-    
+
     def __init__(self, config: PipelineConfig = None):
         self.config = config or PipelineConfig()
         self.session_service = InMemorySessionService()
 
-        # Retry configuration for API calls
         self.retry_options = types.HttpRetryOptions(
             attempts=self.config.retry_attempts,
             exp_base=self.config.retry_delay_multiplier,
@@ -48,210 +53,175 @@ class HybridToolPipeline:
             http_status_codes=[429, 500, 503, 504],
         )
         
-        # Initialize Agents
         self.llm_pipeline = create_processing_pipeline(
-            model_name=self.config.model_name, 
-            retry_config=self.retry_options
-        )
-        self.orchestrator = create_orchestrator(
-            model_name=self.config.model_name, 
-            retry_config=self.retry_options
+            model_name=self.config.model_name, retry_config=self.retry_options
         )
         
-        # Initialize Runners
         self.llm_runner = Runner(
             app_name=self.config.app_name,
             agent=self.llm_pipeline,
-            session_service=self.session_service
-        )
-        self.orchestrator_runner = Runner(
-            app_name=self.config.app_name,
-            agent=self.orchestrator,
-            session_service=self.session_service
+            session_service=self.session_service,
+            plugins=[LoggingPlugin()]
         )
 
-    def _parse_json_safe(self, text: str) -> Optional[Any]:
-        """Safely parses JSON from text, handling markdown code blocks."""
-        try:
-            text = text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            return json.loads(text.strip())
-        except Exception:
-            return None
+    # -------------------------------------------------------------------------
+    # Phase 1 — Fetch & Dedup (PER FEED)
+    # -------------------------------------------------------------------------
 
     async def _phase_fetch_dedup(self, feed_urls: List[str]) -> List[Dict[str, Any]]:
-        """Phase 1: Fetch and Deduplicate articles using the Orchestrator."""
-        print("=== Phase 1: Fetch & Dedup (using FunctionTools) ===")
-        session_id = "orchestrator_session"
-        
-        await self.session_service.create_session(
-            app_name=self.config.app_name,
-            user_id=self.config.user_id,
-            session_id=session_id
-        )
-        
-        prompt = f"""
-        Fetch and deduplicate articles from these RSS feeds: {json.dumps(feed_urls)}
-        
-        Steps:
-        1. Use fetch_rss_articles tool
-        2. Use deduplicate_articles tool
-        3. Tell me how many unique articles are ready for processing
         """
+        Fetch articles from all feeds, deduplicate each feed independently,
+        and return a combined list of per-feed unique articles.
+        """
+        logger.info("=== Phase 1: Fetch & Dedup (per-feed processing) ===")
         
-        unique_articles = []
-        async for event in self.orchestrator_runner.run_async(
-            user_id=self.config.user_id,
-            session_id=session_id,
-            new_message=types.Content(parts=[types.Part.from_text(text=prompt)])
-        ):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if hasattr(part, 'text') and part.text:
-                        print(f"[Orchestrator]: {part.text}\n")
-                    if hasattr(part, 'function_response') and part.function_response:
-                        data = part.function_response.response
-                        if data and 'articles' in data:
-                            unique_articles = data['articles']
-        return unique_articles
 
-    async def _process_single_article(self, article: Dict[str, Any], index: int, total: int, semaphore: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
-        """Process a single article with concurrency control."""
-        async with semaphore:
-            title = article.get('title', 'Untitled')
-            print(f"[{index}/{total}] Processing: {title[:60]}...")
+        feed_fetch_results = fetch_all_rss(feed_urls)
+
+        if not feed_fetch_results:
+            logger.warning("No feed data returned from fetch.")
+            return []
+
+        # Step 2: Dedup per feed
+        all_unique_articles = []
+
+        for feed in feed_fetch_results:
+            feed_url = feed.feed_url
+            last_build_date = feed.last_build_date
+            articles = feed.articles
             
-            article_session_id = f"article_{index}"
+            logger.info(f"Deduplicating feed: {feed_url}")
+            logger.info(f"Fetched {len(articles)} raw items")
+
+            dedup_result = deduplicate_articles_tool(
+                feed_url=feed_url,
+                articles=articles,
+                feed_last_build_date=last_build_date
+            )
+            
+            if dedup_result:
+                unique = dedup_result.articles
+                logger.info(f"Unique articles from {feed_url}: {len(unique)}")
+                all_unique_articles.extend(unique)  
+
+        return all_unique_articles
+
+    # -------------------------------------------------------------------------
+    # Phase 2 — Filter + Tag per article
+    # -------------------------------------------------------------------------
+
+    async def _process_single_article(self, article: Article, index: int, total: int, semaphore: asyncio.Semaphore):
+        """Run LLM pipeline for a single article."""
+        async with semaphore:
+            title = article.title
+            title_short = title[:50] + "..." if len(title) > 50 else title
+            logger.debug(f"[{index}/{total}] Processing: {title_short}")
+
+            session_id = f"article_{index}"
             await self.session_service.create_session(
                 app_name=self.config.app_name,
                 user_id=self.config.user_id,
-                session_id=article_session_id
+                session_id=session_id
             )
-            
+
             article_prompt = f"""
             Title: {title}
-            Summary: {article.get('summary')}
-            Link: {article.get('link')}
+            Summary: {article.summary}
+            Link: {article.link}
             """
-            
+
             filter_result = None
             tag_result = None
-            
-            try:
-                async for event in self.llm_runner.run_async(
-                    user_id=self.config.user_id,
-                    session_id=article_session_id,
-                    new_message=types.Content(parts=[types.Part.from_text(text=article_prompt)])
-                ):
-                    if event.author == "filter_agent" and event.content:
-                        filter_result = event.content.parts[0].text
-                    elif event.author == "tagging_agent" and event.content:
-                        tag_result = event.content.parts[0].text
-                
-                # Process results
-                if filter_result:
-                    filter_data = self._parse_json_safe(filter_result)
-                    if filter_data and filter_data.get("is_ai"):
-                        print(f"[{index}] ✓ AI-related")
-                        
-                        if tag_result:
-                            tag_data = self._parse_json_safe(tag_result)
-                            article['tags'] = tag_data.get('tags', []) if tag_data else []
-                            print(f"[{index}]   Tags: {article['tags']}")
-                        else:
-                            article['tags'] = []
-                            
-                        return article
+
+            async for event in self.llm_runner.run_async(
+                user_id=self.config.user_id,
+                session_id=session_id,
+                new_message=types.Content(parts=[types.Part.from_text(text=article_prompt)])
+            ):
+                if event.author == "filter_agent" and event.content:
+                    filter_result = event.content.parts[0].text
+                elif event.author == "tagging_agent" and event.content:
+                    tag_result = event.content.parts[0].text
+
+            if filter_result:
+                filter_data = parse_pydantic_safe(filter_result, FilterResult)
+                if filter_data and filter_data.is_ai:
+                    logger.info(f"✓ AI-related: {title_short}")
+                    if tag_result:
+                        tag_data = parse_pydantic_safe(tag_result, TagResult)
+                        article.tags = tag_data.tags if tag_data else []
                     else:
-                        reason = filter_data.get('reasoning', '') if filter_data else "Unknown"
-                        print(f"[{index}] ✗ Not AI-related: {reason}")
-            except Exception as e:
-                print(f"[{index}] ⚠ Error processing article: {e}")
-                
+                        article.tags = []
+                    return article
+                else:
+                    reason = filter_data.reasoning if filter_data else "Unknown"
+                    logger.debug(f"✗ Not AI-related: {title_short} - {reason}")
+
             return None
 
-    async def _phase_process_articles(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Phase 2: Filter and Tag each article using the SequentialAgent concurrently."""
-        print(f"\n=== Phase 2: Filter & Tag (using SequentialAgent) ===")
-        
-        # Apply limit
-        if len(articles) > self.config.max_articles:
-            print(f"Limiting processing to first {self.config.max_articles} articles (Quota Safety).")
-            articles = articles[:self.config.max_articles]
-            
-        print(f"Processing {len(articles)} articles concurrently (limit={self.config.concurrency_limit})...\n")
-        
-        semaphore = asyncio.Semaphore(self.config.concurrency_limit)
-        tasks = []
-        
-        for i, article in enumerate(articles, 1):
-            task = self._process_single_article(article, i, len(articles), semaphore)
-            tasks.append(task)
-            
-        results = await asyncio.gather(*tasks)
-        
-        # Filter out None results (non-AI or failed articles)
-        ai_articles = [r for r in results if r is not None]
-        return ai_articles
+    async def _phase_process_articles(self, articles: List[Article]):
+        """Run AI filter + tag pipeline on articles."""
+        logger.info("=== Phase 2: Filter & Tag ===")
 
-    async def _phase_storage(self, articles: List[Dict[str, Any]]):
-        """Phase 3: Store processed articles using the Orchestrator."""
-        print(f"\n=== Phase 3: Storage (using FunctionTool) ===")
-        print(f"Storing {len(articles)} AI articles...\n")
-        
+        if self.config.max_articles == -1:
+            logger.info("Processing all articles.")
+        elif len(articles) > self.config.max_articles:
+            logger.info(f"Limiting to first {self.config.max_articles} articles.")
+            articles = articles[:self.config.max_articles]
+
+        logger.info(f"Processing {len(articles)} articles (concurrency={self.config.concurrency_limit})...")
+
+        semaphore = asyncio.Semaphore(self.config.concurrency_limit)
+        tasks = [
+            self._process_single_article(article, i, len(articles), semaphore)
+            for i, article in enumerate(articles, 1)
+        ]
+
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
+
+    # -------------------------------------------------------------------------
+    # Phase 3 — Store filtered articles
+    # -------------------------------------------------------------------------
+
+    async def _phase_storage(self, articles: List[Article]):
         if not articles:
-            print("No articles to store.")
+            logger.info("No articles to store.")
             return
 
-        session_id = "orchestrator_session"
-        storage_prompt = f"""
-        Store these {len(articles)} articles using the store_articles tool.
-        
-        Articles: {json.dumps(articles)}
-        """
-        
-        async for event in self.orchestrator_runner.run_async(
-            user_id=self.config.user_id,
-            session_id=session_id,
-            new_message=types.Content(parts=[types.Part.from_text(text=storage_prompt)])
-        ):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if hasattr(part, 'text') and part.text:
-                        print(f"[Orchestrator]: {part.text}\n")
+        logger.info(f"Storing {len(articles)} articles...")
+        store_articles(articles)
+
+    # -------------------------------------------------------------------------
+    # Run Pipeline
+    # -------------------------------------------------------------------------
 
     async def run_async(self, feed_urls: List[str]):
-        """Run the full hybrid pipeline."""
-        print("Starting Hybrid Tool Pipeline...")
-        print(f"Processing {len(feed_urls)} RSS feeds...\n")
-        
-        # Phase 1
+        logger.info("Starting Hybrid Tool Pipeline...")
+        logger.info(f"Processing {len(feed_urls)} RSS feeds...")
+
+        # Phase 1 – Fetch + Dedup per feed
         unique_articles = await self._phase_fetch_dedup(feed_urls)
-        
+
         if not unique_articles:
-            print("No articles to process. Stopping.")
+            logger.warning("No unique articles available. Stopping.")
             return
 
-        # Phase 2
+        # Phase 2 – LLM filtering + tagging
         ai_articles = await self._phase_process_articles(unique_articles)
-        
-        # Phase 3
+
+        # Phase 3 – Storage
         await self._phase_storage(ai_articles)
-        
-        print(f"✅ Hybrid Tool Pipeline completed!")
-        print(f"   Fetched → Deduped → Filtered {len(ai_articles)}/{len(unique_articles)} AI articles → Tagged → Stored")
+
+        logger.info("✅ Pipeline Complete!")
+        logger.info(f"Unique fetched articles: {len(unique_articles)}")
+        logger.info(f"AI-related articles stored: {len(ai_articles)}")
 
     def run(self, feed_urls: List[str]):
-        """Synchronous wrapper for run_async."""
         return asyncio.run(self.run_async(feed_urls))
 
+
 if __name__ == "__main__":
-    # Test the pipeline
     pipeline = HybridToolPipeline()
     feeds = ["https://www.databricks.com/feed"]
     pipeline.run(feeds)

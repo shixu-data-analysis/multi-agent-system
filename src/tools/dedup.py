@@ -1,82 +1,180 @@
-import difflib
-from typing import List, Dict, Any
+import re
+import hashlib
+from datetime import datetime
+from rapidfuzz.fuzz import ratio
+from typing import List, Optional
+from src.models.article import Article, DeduplicationResult
 
-def deduplicate_articles(articles: List[Dict[str, Any]], processed_urls: set) -> List[Dict[str, Any]]:
+
+def clean_text(text: str) -> str:
+    """Normalize text for comparing titles and summaries."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", "", text)  # remove HTML tags
+    text = re.sub(r"[\W_]+", " ", text.lower())
+    return " ".join(text.split())
+
+
+def stable_hash(*fields: str) -> str:
+    """Stable deterministic hash for cluster_id generation."""
+    raw = " ".join(fields).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def is_duplicate(article: Article,
+                 processed_urls: set,
+                 seen_titles: List[str],
+                 seen_summaries: List[str],
+                 last_fetched_at: Optional[str]) -> bool:
     """
-    Deduplicates articles based on URL and title similarity.
-
-    Args:
-        articles: List of article dictionaries.
-        processed_urls: Set of already processed URLs.
-
-    Returns:
-        List of unique articles with 'cluster_id' assigned.
+    Multi-layer deduplication:
+    - Skip items older than last_fetched_at
+    - Skip URLs already seen
+    - Fuzzy match title & summary
     """
-    unique_articles = []
+    url = article.link
+    title = clean_text(article.title)
+    summary = clean_text(article.summary)
+
+    # Layer 1: time-based dedup
+    published = article.published
+    if last_fetched_at and published and published <= last_fetched_at:
+        return True
+
+    # Layer 2: URL dedup
+    if url in processed_urls:
+        return True
+
+    # Layer 3 + 4: Title + Summary fuzzy dedup
+    for seen_t, seen_s in zip(seen_titles, seen_summaries):
+        title_sim = ratio(title, seen_t)
+        summary_sim = ratio(summary, seen_s)
+
+        if title_sim > 90:        # strong title match
+            return True
+
+        if title_sim > 80 and summary_sim > 85:  # combined signal
+            return True
+
+    return False
+
+
+def deduplicate_articles(articles: List[Article],
+                         processed_urls: set,
+                         last_fetched_at: Optional[str]) -> List[Article]:
+    """Deduplicate a batch of articles using multi-layer logic."""
+    unique = []
     seen_titles = []
+    seen_summaries = []
 
     for article in articles:
-        url = article.get("link")
-        title = article.get("title")
+        url = article.link
 
-        # 1. Check URL exact match
-        if url in processed_urls:
-            continue
-        
-        # 2. Check title similarity
-        is_duplicate = False
-        for seen_title in seen_titles:
-            similarity = difflib.SequenceMatcher(None, title, seen_title).ratio()
-            if similarity > 0.85:
-                is_duplicate = True
-                break
-        
-        if is_duplicate:
+        if is_duplicate(article, processed_urls, seen_titles, seen_summaries, last_fetched_at):
             continue
 
-        # If unique
+        # Mark as unique
         processed_urls.add(url)
-        seen_titles.append(title)
-        # Assign a simple cluster ID (for now just using index or hash could be enough, 
-        # but here we just mark it as unique. The prompt mentions cluster_ids, 
-        # so we can generate a UUID or just pass it through.)
-        # For simplicity, we'll just return the article as is, 
-        # assuming the calling agent might handle clustering more deeply if needed.
-        # But let's add a placeholder cluster_id.
-        article['cluster_id'] = str(hash(title)) 
-        unique_articles.append(article)
+        seen_titles.append(clean_text(article.title))
+        seen_summaries.append(clean_text(article.summary))
 
-    return unique_articles
+        # stable cluster_id
+        article.cluster_id = url or stable_hash(article.title, article.summary)
 
-def deduplicate_articles_tool(articles: List[Dict[str, Any]]) -> Dict[str, Any]:
+        unique.append(article)
+
+    return unique
+
+
+# ------------------------------------------------------------------
+# ADK Tool Function
+# ------------------------------------------------------------------
+
+def deduplicate_articles_tool(
+    feed_url: str,
+    articles: List[Article],
+    feed_last_build_date: Optional[str] = None
+) -> DeduplicationResult:
     """
-    Deduplicate articles based on title similarity and processed URLs.
-    
+    Deduplicate RSS/Atom articles for a specific feed source.
+
+    Purpose:
+        Agents call this tool after fetching articles from a single feed URL.
+        Deduplication and freshness tracking are maintained separately per feed.
+
     Args:
-        articles: List of article dictionaries to deduplicate.
-    
-    Returns:
-        Dictionary with unique 'articles' list and counts.
-    """
-    from src.tools.storage import load_state
-    
-    # Load processed URLs from state
-    state = load_state()
-    processed_urls = set(state.get("processed_urls", []))
-    
-    # Deduplicate
-    unique_articles = deduplicate_articles(articles, processed_urls)
-    
-    return {
-        "articles": unique_articles,
-        "unique_count": len(unique_articles),
-        "original_count": len(articles),
-        "status": "success"
-    }
+        feed_url (str):
+            The RSS feed URL this batch belongs to. Used as the dedup namespace.
 
-# Create FunctionTool instance
-from google.adk.tools import FunctionTool
-dedup_tool = FunctionTool(deduplicate_articles_tool)
+        articles (List[Dict[str, Any]]):
+            Articles fetched from the feed.
+
+        feed_last_build_date (str, optional):
+            The <lastBuildDate> value from the feed metadata. Used for feed-level
+            skip logic.
+
+    Returns:
+        {
+            "status": "success",
+            "articles": [...],
+            "unique_count": int,
+            "original_count": int,
+            "skipped": bool,
+            "feed_url": str,
+            "last_build_date": str
+        }
+    """
+    from src.utils.state_utils import load_state, save_state
+
+    state = load_state()
+
+    # Initialize feed state if missing
+    feed_state = state["feeds"].get(feed_url, {
+        "processed_urls": [],
+        "last_fetched_at": None,
+        "last_build_date": None,
+    })
+
+    stored_last_build = feed_state.get("last_build_date")
+    last_fetched_at = feed_state.get("last_fetched_at")
+
+    # Feed-level skip using lastBuildDate
+    if feed_last_build_date and stored_last_build:
+        if feed_last_build_date <= stored_last_build:
+            return DeduplicationResult(
+                articles=[],
+                unique_count=0,
+                original_count=len(articles),
+                skipped=True,
+                feed_url=feed_url,
+                last_build_date=stored_last_build
+            )
+
+    # Article-level dedup
+    processed_urls = set(feed_state.get("processed_urls", []))
+    unique = deduplicate_articles(articles, processed_urls, last_fetched_at)
+
+    # Update feed state
+    feed_state["processed_urls"] = list(processed_urls)
+    feed_state["last_fetched_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    if feed_last_build_date:
+        feed_state["last_build_date"] = feed_last_build_date
+
+    # Save global state
+    state["feeds"][feed_url] = feed_state
+    save_state(state)
+
+    return DeduplicationResult(
+        articles=unique,
+        unique_count=len(unique),
+        original_count=len(articles),
+        skipped=False,
+        feed_url=feed_url,
+        last_build_date=feed_state.get("last_build_date")
+    )
+
+
 
 if __name__ == "__main__":
     # Test dedup
