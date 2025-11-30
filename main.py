@@ -9,15 +9,19 @@ This version combines:
 
 from dotenv import load_dotenv
 from src.pipeline import HybridToolPipeline
+from src.utils.logger import setup_logging
 
 if __name__ == "__main__":
     load_dotenv()
     
+    # Initialize logging
+    setup_logging()
+    
     # Default feeds
     feeds = [
         # "https://techcrunch.com/feed/",
-        # "https://www.databricks.com/feed",
-        "https://developers.googleblog.com/feeds/posts/default"
+        "https://www.databricks.com/feed",
+        # "https://developers.googleblog.com/feeds/posts/default"
     ]
     
     pipeline = HybridToolPipeline()
