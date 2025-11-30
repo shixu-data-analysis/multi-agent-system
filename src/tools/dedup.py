@@ -85,11 +85,6 @@ def deduplicate_articles(articles: List[Article],
 
     return unique
 
-
-# ------------------------------------------------------------------
-# ADK Tool Function
-# ------------------------------------------------------------------
-
 def deduplicate_articles_tool(
     feed_url: str,
     articles: List[Article],
@@ -98,31 +93,14 @@ def deduplicate_articles_tool(
     """
     Deduplicate RSS/Atom articles for a specific feed source.
 
-    Purpose:
-        Agents call this tool after fetching articles from a single feed URL.
-        Deduplication and freshness tracking are maintained separately per feed.
-
-    Args:
-        feed_url (str):
-            The RSS feed URL this batch belongs to. Used as the dedup namespace.
-
-        articles (List[Dict[str, Any]]):
-            Articles fetched from the feed.
-
-        feed_last_build_date (str, optional):
-            The <lastBuildDate> value from the feed metadata. Used for feed-level
-            skip logic.
-
     Returns:
-        {
-            "status": "success",
-            "articles": [...],
-            "unique_count": int,
-            "original_count": int,
-            "skipped": bool,
-            "feed_url": str,
-            "last_build_date": str
-        }
+        DeduplicationResult object containing:
+            articles: list of unique articles
+            unique_count: number of unique articles
+            original_count: number of original articles
+            skipped: whether the feed was skipped
+            feed_url: the feed URL
+            last_build_date: the last build date of the feed
     """
     from src.utils.state_utils import load_state, save_state
 
